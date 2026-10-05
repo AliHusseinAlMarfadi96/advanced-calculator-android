@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 import '../l10n/l10n.dart';
 import '../models/app_settings.dart';
@@ -17,6 +18,8 @@ class _CalcKey {
     this.hintKey,
     this.token,
     this.special,
+    this.sortOrder,
+    this.minHeight = 56,
   });
 
   final String id;
@@ -27,10 +30,14 @@ class _CalcKey {
   final _KeyTone tone;
   final String? token;
   final _Special? special;
+  final double? sortOrder;
+  final double minHeight;
 }
 
 enum _Special { clear, backspace, equals, sign }
 
+/// Classic phone-calculator keypad. Digit/operator order is LTR and fixed
+/// (7→1, ops on the right) so TalkBack never follows the app RTL chrome.
 class Keypad extends StatelessWidget {
   const Keypad({
     super.key,
@@ -43,27 +50,127 @@ class Keypad extends StatelessWidget {
   final ButtonSpeaker speaker;
   final AppSettings settings;
 
+  /// Deterministic traversal order used by layout tests and Semantics sortKey.
+  /// Digit 7 appears before digit 1; plus is present near the bottom digits.
+  static List<String> arithmeticKeyIdsInTalkBackOrder() => const [
+        'clear',
+        'del',
+        'sign',
+        'div',
+        'd7',
+        'd8',
+        'd9',
+        'mul',
+        'd4',
+        'd5',
+        'd6',
+        'sub',
+        'd1',
+        'd2',
+        'd3',
+        'd0',
+        'decimal',
+        'eq',
+        'add',
+      ];
+
   @override
   Widget build(BuildContext context) {
-    final keys = _keys();
+    // Force LTR for the keypad only. Parent RTL Directionality must NOT flip
+    // digit rows or reverse TalkBack swipe order.
     return Directionality(
       textDirection: TextDirection.ltr,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final spacing = 8.0;
-          final cols = 4;
-          final width = (constraints.maxWidth - spacing * (cols - 1)) / cols;
-          final height = width.clamp(48.0, 64.0);
-          return Wrap(
-            spacing: spacing,
-            runSpacing: spacing,
+          final cell = ((constraints.maxWidth - spacing * 3) / 4)
+              .clamp(48.0, 72.0);
+          final rowHeight = cell < 56 ? 56.0 : cell;
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              for (final key in keys)
-                SizedBox(
-                  width: width,
-                  height: height,
-                  child: _keyButton(context, key),
+              for (final row in _scientificRows()) ...[
+                _buildRow(context, row, height: rowHeight, spacing: spacing),
+                SizedBox(height: spacing),
+              ],
+              _buildRow(
+                context,
+                [_clear(), _backspace(), _sign(), _divide()],
+                height: rowHeight,
+                spacing: spacing,
+              ),
+              SizedBox(height: spacing),
+              _buildRow(
+                context,
+                [_digit('7'), _digit('8'), _digit('9'), _multiply()],
+                height: rowHeight,
+                spacing: spacing,
+              ),
+              SizedBox(height: spacing),
+              _buildRow(
+                context,
+                [_digit('4'), _digit('5'), _digit('6'), _subtract()],
+                height: rowHeight,
+                spacing: spacing,
+              ),
+              SizedBox(height: spacing),
+              // Bottom block: 1 2 3 / 0 . = with LARGE + spanning two rows.
+              SizedBox(
+                height: rowHeight * 2 + spacing,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: _buildRow(
+                              context,
+                              [_digit('1'), _digit('2'), _digit('3')],
+                              height: rowHeight,
+                              spacing: spacing,
+                            ),
+                          ),
+                          SizedBox(height: spacing),
+                          Expanded(
+                            child: _buildRow(
+                              context,
+                              [
+                                _digit('0'),
+                                _decimal(),
+                                _equals(minHeight: rowHeight),
+                              ],
+                              height: rowHeight,
+                              spacing: spacing,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(width: spacing),
+                    Expanded(
+                      flex: 1,
+                      child: _keyButton(
+                        context,
+                        _add(minHeight: rowHeight * 2 + spacing),
+                        expand: true,
+                      ),
+                    ),
+                  ],
                 ),
+              ),
+              SizedBox(height: spacing),
+              // Comma kept for nroot(base, value); LTR quarter-width so TalkBack finds it after +.
+              Align(
+                alignment: Alignment.centerLeft,
+                child: SizedBox(
+                  width: (constraints.maxWidth - spacing * 3) / 4,
+                  height: rowHeight,
+                  child: _keyButton(context, _comma(), expand: true),
+                ),
+              ),
             ],
           );
         },
@@ -71,15 +178,45 @@ class Keypad extends StatelessWidget {
     );
   }
 
-  Widget _keyButton(BuildContext context, _CalcKey key) {
+  Widget _buildRow(
+    BuildContext context,
+    List<_CalcKey> keys, {
+    required double height,
+    required double spacing,
+  }) {
+    return SizedBox(
+      height: height,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < keys.length; i++) ...[
+            if (i > 0) SizedBox(width: spacing),
+            Expanded(
+              flex: 1,
+              child: _keyButton(context, keys[i], expand: true),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _keyButton(
+    BuildContext context,
+    _CalcKey key, {
+    bool expand = false,
+  }) {
     final label = L10n.text(key.labelKey, settings.language);
     final speech = L10n.text(key.speechKey, settings.language);
     final hint =
         key.hintKey == null ? null : L10n.text(key.hintKey!, settings.language);
-    return Semantics(
+    final button = Semantics(
       button: true,
       label: label,
       hint: hint,
+      sortKey: key.sortOrder == null
+          ? null
+          : OrdinalSortKey(key.sortOrder!, name: key.id),
       child: Material(
         color: _background(key.tone),
         borderRadius: BorderRadius.circular(16),
@@ -99,21 +236,26 @@ class Keypad extends StatelessWidget {
               _perform(key);
             }
           },
-          child: Center(
-            child: Text(
-              key.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-                color: _foreground(key.tone),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: key.minHeight),
+            child: Center(
+              child: Text(
+                key.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: key.id == 'add' || key.id == 'eq' ? 28 : 18,
+                  fontWeight: FontWeight.w700,
+                  color: _foreground(key.tone),
+                ),
               ),
             ),
           ),
         ),
       ),
     );
+    if (expand) return button;
+    return SizedBox(height: key.minHeight, child: button);
   }
 
   Future<void> _speakEqualsResult({required String buttonSpeech}) async {
@@ -179,99 +321,149 @@ class Keypad extends StatelessWidget {
     }
   }
 
-  List<_CalcKey> _keys() => [
-        _fn('sin', 'sin', 'key.sin', 'speak.sin', 'sin('),
-        _fn('cos', 'cos', 'key.cos', 'speak.cos', 'cos('),
-        _fn('tan', 'tan', 'key.tan', 'speak.tan', 'tan('),
-        _fn('sqrt', '√', 'key.sqrt', 'speak.sqrt', 'sqrt('),
-        _fn('ln', 'ln', 'key.ln', 'speak.ln', 'ln('),
-        _fn('log', 'log', 'key.log', 'speak.log', 'log('),
-        _fn('sq', 'x²', 'key.square', 'speak.square', '^2', hint: 'key.square.hint'),
-        _fn('pow', 'xʸ', 'key.power', 'speak.power', '^', hint: 'key.power.hint'),
-        _fn('cbrt', '∛', 'key.cbrt', 'speak.cbrt', 'cbrt('),
-        _fn('nroot', 'ⁿ√', 'key.nroot', 'speak.nroot', 'nroot(', hint: 'key.nroot.hint'),
-        _fn('fact', 'n!', 'key.factorial', 'speak.factorial', '!', hint: 'key.factorial.hint'),
-        _fn('pct', '%', 'key.percent', 'speak.percent', '%', hint: 'key.percent.hint'),
-        _fn('pi', 'π', 'key.pi', 'speak.pi', 'pi'),
-        _fn('e', 'e', 'key.e', 'speak.e', 'e'),
-        _fn('open', '(', 'key.open', 'speak.open', '('),
-        _fn('close', ')', 'key.close', 'speak.close', ')'),
-        const _CalcKey(
-          id: 'clear',
-          title: 'C',
-          labelKey: 'key.clear',
-          hintKey: 'key.clear.hint',
-          speechKey: 'speak.clear',
-          tone: _KeyTone.clear,
-          special: _Special.clear,
-        ),
-        const _CalcKey(
-          id: 'del',
-          title: '⌫',
-          labelKey: 'key.backspace',
-          hintKey: 'key.backspace.hint',
-          speechKey: 'speak.backspace',
-          tone: _KeyTone.function,
-          special: _Special.backspace,
-        ),
-        const _CalcKey(
-          id: 'sign',
-          title: '±',
-          labelKey: 'key.sign',
-          hintKey: 'key.sign.hint',
-          speechKey: 'speak.sign',
-          tone: _KeyTone.function,
-          special: _Special.sign,
-        ),
-        _op('div', '÷', 'speak.divide', 'speak.divide', '/'),
-        _digit('7'),
-        _digit('8'),
-        _digit('9'),
-        _op('mul', '×', 'speak.multiply', 'speak.multiply', '*'),
-        _digit('4'),
-        _digit('5'),
-        _digit('6'),
-        _op('sub', '−', 'speak.subtract', 'speak.subtract', '-'),
-        _digit('1'),
-        _digit('2'),
-        _digit('3'),
-        _op('add', '+', 'speak.add', 'speak.add', '+'),
-        _digit('0'),
-        const _CalcKey(
-          id: 'decimal',
-          title: '.',
-          labelKey: 'key.decimal',
-          speechKey: 'speak.decimal',
-          tone: _KeyTone.digit,
-          token: '.',
-        ),
-        const _CalcKey(
-          id: 'comma',
-          title: ',',
-          labelKey: 'key.comma',
-          hintKey: 'key.comma.hint',
-          speechKey: 'speak.comma',
-          tone: _KeyTone.function,
-          token: ',',
-        ),
-        const _CalcKey(
-          id: 'eq',
-          title: '=',
-          labelKey: 'key.equals',
-          hintKey: 'key.equals.hint',
-          speechKey: 'speak.equals',
-          tone: _KeyTone.equals,
-          special: _Special.equals,
-        ),
+  List<List<_CalcKey>> _scientificRows() => [
+        [
+          _fn('sin', 'sin', 'key.sin', 'speak.sin', 'sin(', order: 1),
+          _fn('cos', 'cos', 'key.cos', 'speak.cos', 'cos(', order: 2),
+          _fn('tan', 'tan', 'key.tan', 'speak.tan', 'tan(', order: 3),
+          _fn('sqrt', '√', 'key.sqrt', 'speak.sqrt', 'sqrt(', order: 4),
+        ],
+        [
+          _fn('ln', 'ln', 'key.ln', 'speak.ln', 'ln(', order: 5),
+          _fn('log', 'log', 'key.log', 'speak.log', 'log(', order: 6),
+          _fn('sq', 'x²', 'key.square', 'speak.square', '^2',
+              hint: 'key.square.hint', order: 7),
+          _fn('pow', 'xʸ', 'key.power', 'speak.power', '^',
+              hint: 'key.power.hint', order: 8),
+        ],
+        [
+          _fn('cbrt', '∛', 'key.cbrt', 'speak.cbrt', 'cbrt(', order: 9),
+          _fn('nroot', 'ⁿ√', 'key.nroot', 'speak.nroot', 'nroot(',
+              hint: 'key.nroot.hint', order: 10),
+          _fn('fact', 'n!', 'key.factorial', 'speak.factorial', '!',
+              hint: 'key.factorial.hint', order: 11),
+          _fn('pct', '%', 'key.percent', 'speak.percent', '%',
+              hint: 'key.percent.hint', order: 12),
+        ],
+        [
+          _fn('pi', 'π', 'key.pi', 'speak.pi', 'pi', order: 13),
+          _fn('e', 'e', 'key.e', 'speak.e', 'e', order: 14),
+          _fn('open', '(', 'key.open', 'speak.open', '(', order: 15),
+          _fn('close', ')', 'key.close', 'speak.close', ')', order: 16),
+        ],
       ];
 
-  _CalcKey _digit(String value) => _CalcKey(
-        id: 'd$value',
-        title: value,
-        labelKey: 'key.digit.$value',
-        speechKey: 'speak.digit.$value',
+  _CalcKey _clear() => const _CalcKey(
+        id: 'clear',
+        title: 'C',
+        labelKey: 'key.clear',
+        hintKey: 'key.clear.hint',
+        speechKey: 'speak.clear',
+        tone: _KeyTone.clear,
+        special: _Special.clear,
+        sortOrder: 20,
+        minHeight: 56,
+      );
+
+  _CalcKey _backspace() => const _CalcKey(
+        id: 'del',
+        title: '⌫',
+        labelKey: 'key.backspace',
+        hintKey: 'key.backspace.hint',
+        speechKey: 'speak.backspace',
+        tone: _KeyTone.function,
+        special: _Special.backspace,
+        sortOrder: 21,
+        minHeight: 56,
+      );
+
+  _CalcKey _sign() => const _CalcKey(
+        id: 'sign',
+        title: '±',
+        labelKey: 'key.sign',
+        hintKey: 'key.sign.hint',
+        speechKey: 'speak.sign',
+        tone: _KeyTone.function,
+        special: _Special.sign,
+        sortOrder: 22,
+        minHeight: 56,
+      );
+
+  _CalcKey _divide() => _op('div', '÷', 'speak.divide', 'speak.divide', '/',
+      order: 23);
+  _CalcKey _multiply() => _op('mul', '×', 'speak.multiply', 'speak.multiply', '*',
+      order: 33);
+  _CalcKey _subtract() => _op('sub', '−', 'speak.subtract', 'speak.subtract', '-',
+      order: 43);
+  _CalcKey _add({required double minHeight}) => _op(
+        'add',
+        '+',
+        'speak.add',
+        'speak.add',
+        '+',
+        order: 60,
+        minHeight: minHeight,
+      );
+
+  _CalcKey _digit(String value) {
+    final order = switch (value) {
+      '7' => 30.0,
+      '8' => 31.0,
+      '9' => 32.0,
+      '4' => 40.0,
+      '5' => 41.0,
+      '6' => 42.0,
+      '1' => 50.0,
+      '2' => 51.0,
+      '3' => 52.0,
+      '0' => 53.0,
+      _ => 54.0,
+    };
+    return _CalcKey(
+      id: 'd$value',
+      title: value,
+      labelKey: 'key.digit.$value',
+      speechKey: 'speak.digit.$value',
+      tone: _KeyTone.digit,
+      token: value,
+      sortOrder: order,
+      minHeight: 56,
+    );
+  }
+
+  _CalcKey _decimal() => const _CalcKey(
+        id: 'decimal',
+        title: '.',
+        labelKey: 'key.decimal',
+        speechKey: 'speak.decimal',
         tone: _KeyTone.digit,
-        token: value,
+        token: '.',
+        sortOrder: 54,
+        minHeight: 56,
+      );
+
+  _CalcKey _comma() => const _CalcKey(
+        id: 'comma',
+        title: ',',
+        labelKey: 'key.comma',
+        hintKey: 'key.comma.hint',
+        speechKey: 'speak.comma',
+        tone: _KeyTone.function,
+        token: ',',
+        sortOrder: 70,
+        minHeight: 56,
+      );
+
+  _CalcKey _equals({required double minHeight}) => _CalcKey(
+        id: 'eq',
+        title: '=',
+        labelKey: 'key.equals',
+        hintKey: 'key.equals.hint',
+        speechKey: 'speak.equals',
+        tone: _KeyTone.equals,
+        special: _Special.equals,
+        sortOrder: 55,
+        minHeight: minHeight < 56 ? 56 : minHeight,
       );
 
   _CalcKey _op(
@@ -279,8 +471,10 @@ class Keypad extends StatelessWidget {
     String title,
     String label,
     String speech,
-    String token,
-  ) =>
+    String token, {
+    double? order,
+    double minHeight = 56,
+  }) =>
       _CalcKey(
         id: id,
         title: title,
@@ -288,6 +482,8 @@ class Keypad extends StatelessWidget {
         speechKey: speech,
         tone: _KeyTone.operation,
         token: token,
+        sortOrder: order,
+        minHeight: minHeight,
       );
 
   _CalcKey _fn(
@@ -297,6 +493,7 @@ class Keypad extends StatelessWidget {
     String speech,
     String token, {
     String? hint,
+    double? order,
   }) =>
       _CalcKey(
         id: id,
@@ -306,5 +503,7 @@ class Keypad extends StatelessWidget {
         speechKey: speech,
         tone: _KeyTone.function,
         token: token,
+        sortOrder: order,
+        minHeight: 56,
       );
 }

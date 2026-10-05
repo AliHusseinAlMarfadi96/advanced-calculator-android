@@ -30,8 +30,13 @@ Release APK is signed with the local debug keystore for sideload distribution.
 
 Unit tests cover the expression evaluator and the speech math parser (Arabic and English phrases).
 
+## v1.0.1
+
+- Classic LTR calculator keypad (Column/Rows, not Wrap): 7-8-9 … 0 with ÷×−+ on the right; large + spanning two rows for TalkBack.
+- Voice assistant: network speech fallback, ar_SA/ar/en_US locale resolution, clearer Arabic status when Google speech services are missing, fixed onError/onStatus pause race.
+
 ## Download
 
 Permanent public APK:
 
-https://github.com/AliHusseinAlMarfadi96/advanced-calculator-android/releases/download/v1.0.0/AdvancedCalculator.apk
+https://github.com/AliHusseinAlMarfadi96/advanced-calculator-android/releases/download/v1.0.1/AdvancedCalculator.apk

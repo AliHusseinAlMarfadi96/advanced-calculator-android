@@ -149,6 +149,7 @@ class L10n {
     'voice.speechDenied': 'إذن التعرف على الكلام مغلق. فعّله من الإعدادات لاستخدام المساعد.',
     'voice.title': 'المساعد الصوتي',
     'voice.unavailable': 'التعرف على الكلام غير متاح لهذه اللغة على هذا الجهاز.',
+    'voice.speechServicesMissing': 'خدمات الكلام من Google غير متوفرة على هذا الجهاز. ثبّت أو حدّث تطبيق Google وخدمات التعرف على الكلام ثم أعد المحاولة.',
     'voice.youSaid': 'قلت',
   };
   static const _en = <String, String>{
@@ -298,6 +299,7 @@ class L10n {
     'voice.speechDenied': 'Speech recognition is off. Enable it in Settings to use the assistant.',
     'voice.title': 'Voice assistant',
     'voice.unavailable': 'Speech recognition is unavailable for this language on this device.',
+    'voice.speechServicesMissing': 'Google speech services are missing on this device. Install or update Google app and speech recognition, then try again.',
     'voice.youSaid': 'You said',
   };
 

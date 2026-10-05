@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
 import '../core/app_phrases.dart';
@@ -43,6 +44,13 @@ class VoiceAssistantController extends ChangeNotifier {
   String? _evaluatedTranscript;
   bool _didRequestClose = false;
   bool _speechReady = false;
+  String? _resolvedLocaleId;
+  /// Prefer network recognition; on-device Arabic is often missing.
+  bool _preferOnDevice = false;
+  bool _onDeviceFailed = false;
+  DateTime? _listenStartedAt;
+  bool _handlingSpeechError = false;
+  bool _ttsReady = false;
   VoidCallback? onRequestClose;
 
   static const _runningTotalKey = 'advancedCalculator.voiceRunningTotal';
@@ -59,7 +67,13 @@ class VoiceAssistantController extends ChangeNotifier {
     statusText = L10n.text('voice.listening', settings.language);
     notifyListeners();
 
-    final mic = await Permission.microphone.request();
+    // Request mic with rationale already shown by the screen; re-check here.
+    final micStatus = await Permission.microphone.status;
+    if (_exited) return;
+    PermissionStatus mic = micStatus;
+    if (!mic.isGranted) {
+      mic = await Permission.microphone.request();
+    }
     if (_exited) return;
     if (!mic.isGranted) {
       micDenied = true;
@@ -70,28 +84,187 @@ class VoiceAssistantController extends ChangeNotifier {
     }
 
     _speechReady = await _speech.initialize(
-      onError: (e) {
-        if (!_exited) {
-          _finishUtterance(endOfTask: true);
-        }
-      },
-      onStatus: (status) {
-        if (status == 'done' || status == 'notListening') {
-          if (_acceptingResults) {
-            _finishUtterance(endOfTask: true);
-          }
-        }
-      },
+      onError: _onSpeechError,
+      onStatus: _onSpeechStatus,
     );
     if (_exited) return;
     if (!_speechReady) {
-      statusText = L10n.text('voice.unavailable', settings.language);
+      statusText = L10n.text('voice.speechServicesMissing', settings.language);
       isPaused = true;
       notifyListeners();
       return;
     }
-    await _tts.awaitSpeakCompletion(true);
+
+    _resolvedLocaleId = await _resolveLocaleId(settings);
+    if (_exited) return;
+    if (_resolvedLocaleId == null) {
+      statusText = L10n.text('voice.speechServicesMissing', settings.language);
+      isPaused = true;
+      notifyListeners();
+      return;
+    }
+
+    await _ensureTtsReady(settings);
     beginListening();
+  }
+
+  Future<void> _ensureTtsReady(AppSettings settings) async {
+    if (_ttsReady) return;
+    await _tts.awaitSpeakCompletion(true);
+    final preferred = settings.language == AppLanguage.ar ? 'ar-SA' : 'en-US';
+    final set = await _tts.setLanguage(preferred);
+    if (set == 0 || set == false) {
+      // Fallbacks for devices that only expose short language tags.
+      if (settings.language == AppLanguage.ar) {
+        await _tts.setLanguage('ar');
+      } else {
+        await _tts.setLanguage('en-US');
+      }
+    }
+    _ttsReady = true;
+  }
+
+  /// Prefer ar_SA / ar-SA, then any ar*, then en_US / en.
+  Future<String?> _resolveLocaleId(AppSettings settings) async {
+    List<LocaleName> available;
+    try {
+      available = await _speech.locales();
+    } catch (_) {
+      available = const [];
+    }
+    final ids = available.map((l) => l.localeId).toList();
+    String norm(String s) => s.replaceAll('-', '_').toLowerCase();
+    final normalized = {for (final id in ids) norm(id): id};
+
+    final preferred = <String>[
+      if (settings.language == AppLanguage.ar) ...[
+        'ar_sa',
+        'ar',
+        'ar_eg',
+        'ar_ae',
+      ] else ...[
+        'en_us',
+        'en',
+        'en_gb',
+      ],
+      // Always keep a cross-language fallback so recognition still works.
+      'ar_sa',
+      'ar',
+      'en_us',
+      'en',
+    ];
+
+    for (final want in preferred) {
+      final exact = normalized[want];
+      if (exact != null) return exact;
+      // Prefix match: ar_* or en_*
+      final prefix = want.split('_').first;
+      for (final entry in normalized.entries) {
+        if (entry.key == prefix || entry.key.startsWith('${prefix}_')) {
+          return entry.value;
+        }
+      }
+    }
+
+    if (ids.isNotEmpty) return ids.first;
+    // Device reported no locales but initialize succeeded — still try preferred.
+    return settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US';
+  }
+
+  void _onSpeechError(SpeechRecognitionError error) {
+    if (_exited || _handlingSpeechError) return;
+    _handlingSpeechError = true;
+    try {
+      final code = error.errorMsg;
+      debugPrint('speech error: $code permanent=${error.permanent}');
+
+      // Permanent: missing / disabled recognizer → surface Arabic status, pause.
+      if (code.contains('error_speech_recognizer_disabled') ||
+          code.contains('error_client') && error.permanent) {
+        final settings = _settings;
+        if (settings != null) {
+          statusText =
+              L10n.text('voice.speechServicesMissing', settings.language);
+          isPaused = true;
+          _acceptingResults = false;
+          notifyListeners();
+        }
+        return;
+      }
+
+      // Offline language missing → fall back to network recognition.
+      if (code.contains('error_language_not_supported') ||
+          code.contains('error_language_unavailable')) {
+        if (_preferOnDevice && !_onDeviceFailed) {
+          _onDeviceFailed = true;
+          _preferOnDevice = false;
+          _acceptingResults = false;
+          _stopEngine();
+          _scheduleListenAgain(after: const Duration(milliseconds: 400));
+          return;
+        }
+        final settings = _settings;
+        if (settings != null) {
+          statusText =
+              L10n.text('voice.speechServicesMissing', settings.language);
+          // Do not pause forever — retry with network after a beat.
+          _preferOnDevice = false;
+          _acceptingResults = false;
+          _stopEngine();
+          notifyListeners();
+          _scheduleListenAgain(after: const Duration(seconds: 2));
+        }
+        return;
+      }
+
+      // Transient: no-match / timeout / network → finish utterance or retry.
+      if (code.contains('error_no_match') ||
+          code.contains('error_speech_timeout') ||
+          code.contains('error_network') ||
+          code.contains('error_network_timeout') ||
+          code.contains('error_busy') ||
+          code.contains('error_retry') ||
+          code.contains('error_server')) {
+        if (_preferOnDevice &&
+            (code.contains('error_network') ||
+                code.contains('error_language'))) {
+          // Should not happen for on-device, but flip to network just in case.
+          _preferOnDevice = false;
+          _onDeviceFailed = true;
+        }
+        if (_acceptingResults) {
+          _finishUtterance(endOfTask: true);
+        } else {
+          _scheduleListenAgain(after: const Duration(milliseconds: 800));
+        }
+        return;
+      }
+
+      // Unknown: do not pause forever; retry gently.
+      if (_acceptingResults) {
+        _finishUtterance(endOfTask: true);
+      } else if (!isPaused && !_exited) {
+        _scheduleListenAgain(after: const Duration(seconds: 1));
+      }
+    } finally {
+      _handlingSpeechError = false;
+    }
+  }
+
+  void _onSpeechStatus(String status) {
+    if (_exited) return;
+    // Ignore spurious notListening/done that fire immediately when listen starts
+    // (Android race that previously paused the assistant forever).
+    final started = _listenStartedAt;
+    if (started != null &&
+        DateTime.now().difference(started) < const Duration(milliseconds: 450)) {
+      return;
+    }
+    if (status == 'done' || status == 'notListening') {
+      if (_acceptingResults) {
+        _finishUtterance(endOfTask: true);
+      }
+    }
   }
 
   void cancelTapped() {
@@ -225,42 +398,63 @@ class VoiceAssistantController extends ChangeNotifier {
     _continuationBase = _runningTotal;
     _stopEngine();
     if (!_speechReady) {
-      statusText = L10n.text('voice.unavailable', settings.language);
+      statusText = L10n.text('voice.speechServicesMissing', settings.language);
       isPaused = true;
       notifyListeners();
       return;
     }
+    // Stamp before accepting so late notListening from stop() is ignored.
+    _listenStartedAt = DateTime.now();
     _acceptingResults = true;
     showingExactError = false;
     _transcriptReadyForEval = false;
     statusText = L10n.text('voice.listening', settings.language);
     notifyListeners();
-    final localeId = settings.language.speechLocale;
-    await _speech.listen(
-      onResult: (result) {
-        if (!_acceptingResults || _exited) return;
-        final text = result.recognizedWords.trim();
-        if (text.isNotEmpty) {
-          transcript = result.recognizedWords;
-          if (_handleCommandIfPresent(transcript)) return;
-          _transcriptReadyForEval = true;
-          notifyListeners();
-          _scheduleSettle();
-        }
-        if (result.finalResult) {
-          _finishUtterance(endOfTask: true);
-        }
-      },
-      listenOptions: SpeechListenOptions(
-        partialResults: true,
-        listenMode: ListenMode.confirmation,
-        cancelOnError: false,
-        onDevice: true,
-        localeId: localeId,
-        pauseFor: const Duration(seconds: 2),
-        listenFor: const Duration(seconds: 30),
-      ),
-    );
+
+    final localeId = _resolvedLocaleId ??
+        (settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US');
+    // Use network recognition when on-device failed or is not preferred.
+    final useOnDevice = _preferOnDevice && !_onDeviceFailed;
+    try {
+      await _speech.listen(
+        onResult: (result) {
+          if (!_acceptingResults || _exited) return;
+          final text = result.recognizedWords.trim();
+          if (text.isNotEmpty) {
+            transcript = result.recognizedWords;
+            if (_handleCommandIfPresent(transcript)) return;
+            _transcriptReadyForEval = true;
+            notifyListeners();
+            _scheduleSettle();
+          }
+          if (result.finalResult) {
+            _finishUtterance(endOfTask: true);
+          }
+        },
+        listenOptions: SpeechListenOptions(
+          partialResults: true,
+          listenMode: ListenMode.confirmation,
+          cancelOnError: false,
+          onDevice: useOnDevice,
+          localeId: localeId,
+          pauseFor: const Duration(seconds: 2),
+          listenFor: const Duration(seconds: 30),
+        ),
+      );
+    } catch (e) {
+      debugPrint('speech listen failed: $e');
+      if (useOnDevice) {
+        _onDeviceFailed = true;
+        _preferOnDevice = false;
+        _acceptingResults = false;
+        _scheduleListenAgain(after: const Duration(milliseconds: 500));
+        return;
+      }
+      _acceptingResults = false;
+      statusText = L10n.text('voice.speechServicesMissing', settings.language);
+      notifyListeners();
+      _scheduleListenAgain(after: const Duration(seconds: 2));
+    }
   }
 
   void _scheduleSettle({bool force = false}) {
@@ -389,7 +583,19 @@ class VoiceAssistantController extends ChangeNotifier {
   Future<void> _speak(String text, {required String languageCode}) async {
     final settings = _settings;
     await _tts.stop();
-    await _tts.setLanguage(languageCode);
+    var lang = languageCode;
+    var set = await _tts.setLanguage(lang);
+    if (set == 0 || set == false) {
+      if (lang.startsWith('ar')) {
+        lang = 'ar';
+        set = await _tts.setLanguage(lang);
+        if (set == 0 || set == false) {
+          await _tts.setLanguage('ar-SA');
+        }
+      } else {
+        await _tts.setLanguage('en-US');
+      }
+    }
     await _tts.setSpeechRate(
       (settings?.speechRate ?? AppSettings.defaultSpeechRate).clamp(0.0, 1.0),
     );
