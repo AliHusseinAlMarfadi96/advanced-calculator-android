@@ -30,6 +30,12 @@ Release APK is signed with the local debug keystore for sideload distribution.
 
 Unit tests cover the expression evaluator and the speech math parser (Arabic and English phrases).
 
+## v1.0.2
+
+- Stronger classic LTR keypad: digits 7→1, ops on the right; tall +; full-width high-contrast = bar (min 64) with TalkBack label يساوي.
+- No Wrap; scientific rows stay LTR under Arabic RTL chrome; widget test covers key order and sizes.
+- Voice: speech_to_text init with Android intentLookup/noBluetooth/alwaysUseStop; listenFor/pauseFor; never onDevice; dictation mode; auto-retry + locale rotation; SpeechRecognizer Intent fallback when continuous listen fails.
+
 ## v1.0.1
 
 - Classic LTR calculator keypad (Column/Rows, not Wrap): 7-8-9 … 0 with ÷×−+ on the right; large + spanning two rows for TalkBack.
@@ -39,4 +45,4 @@ Unit tests cover the expression evaluator and the speech math parser (Arabic and
 
 Permanent public APK:
 
-https://github.com/AliHusseinAlMarfadi96/advanced-calculator-android/releases/download/v1.0.1/AdvancedCalculator.apk
+https://github.com/AliHusseinAlMarfadi96/advanced-calculator-android/releases/download/v1.0.2/AdvancedCalculator.apk

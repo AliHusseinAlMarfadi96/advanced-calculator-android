@@ -16,6 +16,7 @@ import '../models/app_settings.dart';
 import '../models/history_entry.dart';
 import '../models/history_store.dart';
 import 'cue_player.dart';
+import 'speech_intent_fallback.dart';
 
 class VoiceAssistantController extends ChangeNotifier {
   String statusText = '';
@@ -31,6 +32,7 @@ class VoiceAssistantController extends ChangeNotifier {
   HistoryStore? _history;
   final SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
+  final SpeechIntentFallback _intentFallback = SpeechIntentFallback();
   int _generation = 0;
   bool _started = false;
   bool _exited = false;
@@ -38,6 +40,7 @@ class VoiceAssistantController extends ChangeNotifier {
   HistoryEntry? _pendingEntry;
   Timer? _retryTimer;
   Timer? _settleTimer;
+  Timer? _listenWatchdog;
   bool _transcriptReadyForEval = false;
   double _runningTotal = 0;
   double _continuationBase = 0;
@@ -45,15 +48,15 @@ class VoiceAssistantController extends ChangeNotifier {
   bool _didRequestClose = false;
   bool _speechReady = false;
   String? _resolvedLocaleId;
-  /// Prefer network recognition; on-device Arabic is often missing.
-  bool _preferOnDevice = false;
-  bool _onDeviceFailed = false;
   DateTime? _listenStartedAt;
   bool _handlingSpeechError = false;
   bool _ttsReady = false;
+  int _consecutiveListenFails = 0;
+  bool _usingIntentFallback = false;
   VoidCallback? onRequestClose;
 
   static const _runningTotalKey = 'advancedCalculator.voiceRunningTotal';
+  static const _maxListenFailsBeforeFallback = 2;
 
   Future<void> start({
     required AppSettings settings,
@@ -67,7 +70,6 @@ class VoiceAssistantController extends ChangeNotifier {
     statusText = L10n.text('voice.listening', settings.language);
     notifyListeners();
 
-    // Request mic with rationale already shown by the screen; re-check here.
     final micStatus = await Permission.microphone.status;
     if (_exited) return;
     PermissionStatus mic = micStatus;
@@ -83,29 +85,47 @@ class VoiceAssistantController extends ChangeNotifier {
       return;
     }
 
-    _speechReady = await _speech.initialize(
-      onError: _onSpeechError,
-      onStatus: _onSpeechStatus,
-    );
+    _speechReady = await _initializeSpeechEngine();
     if (_exited) return;
     if (!_speechReady) {
-      statusText = L10n.text('voice.speechServicesMissing', settings.language);
-      isPaused = true;
+      // Fall through to Intent fallback path rather than pausing forever.
+      debugPrint('speech_to_text initialize failed — will use Intent fallback');
+      _usingIntentFallback = true;
+      statusText = L10n.text('voice.listening', settings.language);
       notifyListeners();
+      beginListening();
       return;
     }
 
     _resolvedLocaleId = await _resolveLocaleId(settings);
     if (_exited) return;
-    if (_resolvedLocaleId == null) {
-      statusText = L10n.text('voice.speechServicesMissing', settings.language);
-      isPaused = true;
-      notifyListeners();
-      return;
-    }
+    _resolvedLocaleId ??=
+        settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US';
 
     await _ensureTtsReady(settings);
     beginListening();
+  }
+
+  Future<bool> _initializeSpeechEngine() async {
+    try {
+      // Android workarounds that help on more OEM builds:
+      // intentLookup finds the recognizer when the default intent is missing;
+      // noBluetooth avoids an extra permission some builds gate on;
+      // alwaysUseStop improves teardown between listen cycles.
+      final ok = await _speech.initialize(
+        onError: _onSpeechError,
+        onStatus: _onSpeechStatus,
+        options: [
+          SpeechToText.androidIntentLookup,
+          SpeechToText.androidNoBluetooth,
+          SpeechToText.androidAlwaysUseStop,
+        ],
+      );
+      return ok;
+    } catch (e) {
+      debugPrint('speech initialize exception: $e');
+      return false;
+    }
   }
 
   Future<void> _ensureTtsReady(AppSettings settings) async {
@@ -114,7 +134,6 @@ class VoiceAssistantController extends ChangeNotifier {
     final preferred = settings.language == AppLanguage.ar ? 'ar-SA' : 'en-US';
     final set = await _tts.setLanguage(preferred);
     if (set == 0 || set == false) {
-      // Fallbacks for devices that only expose short language tags.
       if (settings.language == AppLanguage.ar) {
         await _tts.setLanguage('ar');
       } else {
@@ -142,12 +161,13 @@ class VoiceAssistantController extends ChangeNotifier {
         'ar',
         'ar_eg',
         'ar_ae',
+        'ar_jo',
+        'ar_kw',
       ] else ...[
         'en_us',
         'en',
         'en_gb',
       ],
-      // Always keep a cross-language fallback so recognition still works.
       'ar_sa',
       'ar',
       'en_us',
@@ -157,7 +177,6 @@ class VoiceAssistantController extends ChangeNotifier {
     for (final want in preferred) {
       final exact = normalized[want];
       if (exact != null) return exact;
-      // Prefix match: ar_* or en_*
       final prefix = want.split('_').first;
       for (final entry in normalized.entries) {
         if (entry.key == prefix || entry.key.startsWith('${prefix}_')) {
@@ -167,7 +186,6 @@ class VoiceAssistantController extends ChangeNotifier {
     }
 
     if (ids.isNotEmpty) return ids.first;
-    // Device reported no locales but initialize succeeded — still try preferred.
     return settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US';
   }
 
@@ -177,73 +195,69 @@ class VoiceAssistantController extends ChangeNotifier {
     try {
       final code = error.errorMsg;
       debugPrint('speech error: $code permanent=${error.permanent}');
+      final settings = _settings;
 
-      // Permanent: missing / disabled recognizer → surface Arabic status, pause.
       if (code.contains('error_speech_recognizer_disabled') ||
-          code.contains('error_client') && error.permanent) {
-        final settings = _settings;
+          (code.contains('error_client') && error.permanent) ||
+          code.contains('error_insufficient_permissions')) {
         if (settings != null) {
           statusText =
               L10n.text('voice.speechServicesMissing', settings.language);
-          isPaused = true;
-          _acceptingResults = false;
           notifyListeners();
         }
+        _consecutiveListenFails++;
+        _acceptingResults = false;
+        if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+          _usingIntentFallback = true;
+        }
+        _scheduleListenAgain(after: const Duration(milliseconds: 900));
         return;
       }
 
-      // Offline language missing → fall back to network recognition.
       if (code.contains('error_language_not_supported') ||
           code.contains('error_language_unavailable')) {
-        if (_preferOnDevice && !_onDeviceFailed) {
-          _onDeviceFailed = true;
-          _preferOnDevice = false;
-          _acceptingResults = false;
-          _stopEngine();
-          _scheduleListenAgain(after: const Duration(milliseconds: 400));
-          return;
-        }
-        final settings = _settings;
+        _acceptingResults = false;
+        _stopEngine();
+        // Rotate locale and retry; never pause forever.
+        _rotateLocaleFallback();
         if (settings != null) {
-          statusText =
-              L10n.text('voice.speechServicesMissing', settings.language);
-          // Do not pause forever — retry with network after a beat.
-          _preferOnDevice = false;
-          _acceptingResults = false;
-          _stopEngine();
+          statusText = L10n.text('voice.retrying', settings.language);
           notifyListeners();
-          _scheduleListenAgain(after: const Duration(seconds: 2));
         }
+        _scheduleListenAgain(after: const Duration(milliseconds: 600));
         return;
       }
 
-      // Transient: no-match / timeout / network → finish utterance or retry.
       if (code.contains('error_no_match') ||
           code.contains('error_speech_timeout') ||
           code.contains('error_network') ||
           code.contains('error_network_timeout') ||
           code.contains('error_busy') ||
           code.contains('error_retry') ||
-          code.contains('error_server')) {
-        if (_preferOnDevice &&
-            (code.contains('error_network') ||
-                code.contains('error_language'))) {
-          // Should not happen for on-device, but flip to network just in case.
-          _preferOnDevice = false;
-          _onDeviceFailed = true;
-        }
-        if (_acceptingResults) {
+          code.contains('error_server') ||
+          code.contains('error_audio')) {
+        if (_acceptingResults && transcript.trim().isNotEmpty) {
           _finishUtterance(endOfTask: true);
         } else {
+          _consecutiveListenFails++;
+          if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+            _usingIntentFallback = true;
+          }
+          if (settings != null &&
+              (code.contains('error_network') ||
+                  code.contains('error_server'))) {
+            statusText = L10n.text('voice.networkError', settings.language);
+            notifyListeners();
+          }
           _scheduleListenAgain(after: const Duration(milliseconds: 800));
         }
         return;
       }
 
-      // Unknown: do not pause forever; retry gently.
-      if (_acceptingResults) {
+      if (_acceptingResults && transcript.trim().isNotEmpty) {
         _finishUtterance(endOfTask: true);
       } else if (!isPaused && !_exited) {
+        _consecutiveListenFails++;
         _scheduleListenAgain(after: const Duration(seconds: 1));
       }
     } finally {
@@ -251,10 +265,21 @@ class VoiceAssistantController extends ChangeNotifier {
     }
   }
 
+  void _rotateLocaleFallback() {
+    final settings = _settings;
+    if (settings == null) return;
+    final current = (_resolvedLocaleId ?? '').toLowerCase();
+    if (current.startsWith('ar')) {
+      _resolvedLocaleId = 'en_US';
+    } else if (settings.language == AppLanguage.ar) {
+      _resolvedLocaleId = 'ar_SA';
+    } else {
+      _resolvedLocaleId = 'en_US';
+    }
+  }
+
   void _onSpeechStatus(String status) {
     if (_exited) return;
-    // Ignore spurious notListening/done that fire immediately when listen starts
-    // (Android race that previously paused the assistant forever).
     final started = _listenStartedAt;
     if (started != null &&
         DateTime.now().difference(started) < const Duration(milliseconds: 450)) {
@@ -271,8 +296,10 @@ class VoiceAssistantController extends ChangeNotifier {
     _generation++;
     _retryTimer?.cancel();
     _settleTimer?.cancel();
+    _listenWatchdog?.cancel();
     _tts.stop();
     _stopEngine();
+    _intentFallback.cancel();
     _transcriptReadyForEval = false;
     _evaluatedTranscript = null;
     transcript = '';
@@ -302,8 +329,10 @@ class VoiceAssistantController extends ChangeNotifier {
     _generation++;
     _retryTimer?.cancel();
     _settleTimer?.cancel();
+    _listenWatchdog?.cancel();
     _tts.stop();
     _stopEngine();
+    _intentFallback.cancel();
     isPaused = true;
     showingExactError = false;
     statusText = L10n.text('voice.paused', settings.language);
@@ -364,8 +393,10 @@ class VoiceAssistantController extends ChangeNotifier {
     _generation++;
     _retryTimer?.cancel();
     _settleTimer?.cancel();
+    _listenWatchdog?.cancel();
     await _tts.stop();
     _stopEngine();
+    await _intentFallback.cancel();
     await CuePlayer.stop();
   }
 
@@ -375,7 +406,11 @@ class VoiceAssistantController extends ChangeNotifier {
     final generation = _generation;
     Future<void> fire() async {
       if (_generation != generation || _exited || isPaused) return;
-      await _startRecognition();
+      if (_usingIntentFallback || !_speechReady) {
+        await _startIntentFallbackRecognition();
+      } else {
+        await _startRecognition();
+      }
     }
 
     final cue = settings.startCue;
@@ -391,6 +426,41 @@ class VoiceAssistantController extends ChangeNotifier {
     }
   }
 
+  Future<void> _startIntentFallbackRecognition() async {
+    final settings = _settings;
+    if (settings == null || _exited || isPaused) return;
+    await CuePlayer.stop();
+    _continuationBase = _runningTotal;
+    _acceptingResults = true;
+    showingExactError = false;
+    _transcriptReadyForEval = false;
+    statusText = L10n.text('voice.listening', settings.language);
+    notifyListeners();
+
+    final localeId = (_resolvedLocaleId ??
+            (settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US'))
+        .replaceAll('_', '-');
+
+    final text = await _intentFallback.listenOnce(localeId: localeId);
+    if (_exited || isPaused) return;
+    _acceptingResults = false;
+    if (text == null || text.isEmpty) {
+      _consecutiveListenFails++;
+      if (settings.language == AppLanguage.ar) {
+        statusText = L10n.text('voice.retrying', settings.language);
+        notifyListeners();
+      }
+      _scheduleListenAgain(after: const Duration(milliseconds: 900));
+      return;
+    }
+    _consecutiveListenFails = 0;
+    transcript = text;
+    _transcriptReadyForEval = true;
+    notifyListeners();
+    if (_handleCommandIfPresent(text)) return;
+    await _interpretFinalTranscript();
+  }
+
   Future<void> _startRecognition() async {
     final settings = _settings;
     if (settings == null || _exited || isPaused) return;
@@ -398,12 +468,10 @@ class VoiceAssistantController extends ChangeNotifier {
     _continuationBase = _runningTotal;
     _stopEngine();
     if (!_speechReady) {
-      statusText = L10n.text('voice.speechServicesMissing', settings.language);
-      isPaused = true;
-      notifyListeners();
+      _usingIntentFallback = true;
+      await _startIntentFallbackRecognition();
       return;
     }
-    // Stamp before accepting so late notListening from stop() is ignored.
     _listenStartedAt = DateTime.now();
     _acceptingResults = true;
     showingExactError = false;
@@ -413,14 +481,34 @@ class VoiceAssistantController extends ChangeNotifier {
 
     final localeId = _resolvedLocaleId ??
         (settings.language == AppLanguage.ar ? 'ar_SA' : 'en_US');
-    // Use network recognition when on-device failed or is not preferred.
-    final useOnDevice = _preferOnDevice && !_onDeviceFailed;
+
+    // Watchdog: if listen never actually starts, auto-retry / fall back.
+    _listenWatchdog?.cancel();
+    final generation = _generation;
+    _listenWatchdog = Timer(const Duration(milliseconds: 1600), () {
+      if (_generation != generation || _exited || isPaused) return;
+      if (!_speech.isListening && _acceptingResults) {
+        debugPrint('listen watchdog: not listening — retry/fallback');
+        _acceptingResults = false;
+        _consecutiveListenFails++;
+        if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+          _usingIntentFallback = true;
+        }
+        _scheduleListenAgain(after: const Duration(milliseconds: 400));
+      }
+    });
+
     try {
+      // Pass listenFor/pauseFor both via options AND top-level (compat).
+      // Never force onDevice — Arabic on-device packs are often missing.
+      // listenFor / pauseFor / localeId live on SpeechListenOptions (required on
+      // many Android builds). Never force onDevice — Arabic packs are often missing.
       await _speech.listen(
         onResult: (result) {
           if (!_acceptingResults || _exited) return;
           final text = result.recognizedWords.trim();
           if (text.isNotEmpty) {
+            _consecutiveListenFails = 0;
             transcript = result.recognizedWords;
             if (_handleCommandIfPresent(transcript)) return;
             _transcriptReadyForEval = true;
@@ -433,27 +521,60 @@ class VoiceAssistantController extends ChangeNotifier {
         },
         listenOptions: SpeechListenOptions(
           partialResults: true,
-          listenMode: ListenMode.confirmation,
+          listenMode: ListenMode.dictation,
           cancelOnError: false,
-          onDevice: useOnDevice,
+          onDevice: false,
           localeId: localeId,
-          pauseFor: const Duration(seconds: 2),
-          listenFor: const Duration(seconds: 30),
+          pauseFor: const Duration(seconds: 3),
+          listenFor: const Duration(seconds: 45),
         ),
       );
+
+      // Brief settle then confirm engine actually started.
+      await Future<void>.delayed(const Duration(milliseconds: 350));
+      if (_exited || isPaused || !_acceptingResults) return;
+      if (!_speech.isListening) {
+        debugPrint('listen returned but isListening=false');
+        _acceptingResults = false;
+        _consecutiveListenFails++;
+        if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+          _usingIntentFallback = true;
+        }
+        // Try re-init once before falling back.
+        if (_consecutiveListenFails == 1) {
+          await _reinitializeSpeech();
+        }
+        _scheduleListenAgain(after: const Duration(milliseconds: 500));
+      }
     } catch (e) {
       debugPrint('speech listen failed: $e');
-      if (useOnDevice) {
-        _onDeviceFailed = true;
-        _preferOnDevice = false;
-        _acceptingResults = false;
-        _scheduleListenAgain(after: const Duration(milliseconds: 500));
-        return;
-      }
       _acceptingResults = false;
-      statusText = L10n.text('voice.speechServicesMissing', settings.language);
-      notifyListeners();
-      _scheduleListenAgain(after: const Duration(seconds: 2));
+      _consecutiveListenFails++;
+      if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+        _usingIntentFallback = true;
+      }
+      if (_settings != null) {
+        statusText = L10n.text('voice.retrying', _settings!.language);
+        notifyListeners();
+      }
+      if (_consecutiveListenFails == 1) {
+        await _reinitializeSpeech();
+      }
+      _scheduleListenAgain(after: const Duration(milliseconds: 700));
+    }
+  }
+
+  Future<void> _reinitializeSpeech() async {
+    // speech_to_text is a process-wide singleton; initialize() is a no-op after
+    // the first success. Best recovery: cancel the session, rotate locale, and
+    // escalate to the Android SpeechRecognizer Intent fallback.
+    try {
+      await _speech.cancel();
+    } catch (_) {}
+    _rotateLocaleFallback();
+    if (_consecutiveListenFails >= _maxListenFailsBeforeFallback) {
+      _usingIntentFallback = true;
+      _speechReady = false;
     }
   }
 
@@ -481,6 +602,7 @@ class VoiceAssistantController extends ChangeNotifier {
     }
     _acceptingResults = false;
     _settleTimer?.cancel();
+    _listenWatchdog?.cancel();
     _stopEngine();
     if (shouldInterpret) {
       _interpretFinalTranscript();
@@ -647,6 +769,7 @@ class VoiceAssistantController extends ChangeNotifier {
     _acceptingResults = false;
     _settleTimer?.cancel();
     _retryTimer?.cancel();
+    _listenWatchdog?.cancel();
     _stopEngine();
     switch (command) {
       case _AssistantVoiceCommand.clearMemory:
@@ -685,6 +808,7 @@ class VoiceAssistantController extends ChangeNotifier {
 
   void _stopEngine() {
     _acceptingResults = false;
+    _listenWatchdog?.cancel();
     if (_speech.isListening) {
       _speech.stop();
     }

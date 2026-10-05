@@ -36,8 +36,12 @@ class _CalcKey {
 
 enum _Special { clear, backspace, equals, sign }
 
-/// Classic phone-calculator keypad. Digit/operator order is LTR and fixed
-/// (7→1, ops on the right) so TalkBack never follows the app RTL chrome.
+/// Classic phone-calculator keypad.
+///
+/// Digits read left-to-right, 7→1 top-to-bottom. Operators sit on the RIGHT.
+/// Both + (tall, two rows) and = (full-width bottom bar, min 64) are large
+/// easy targets. The whole keypad is forced LTR so Arabic RTL chrome never
+/// reverses digit order or TalkBack swipe order. No Wrap.
 class Keypad extends StatelessWidget {
   const Keypad({
     super.key,
@@ -50,8 +54,8 @@ class Keypad extends StatelessWidget {
   final ButtonSpeaker speaker;
   final AppSettings settings;
 
-  /// Deterministic traversal order used by layout tests and Semantics sortKey.
-  /// Digit 7 appears before digit 1; plus is present near the bottom digits.
+  /// Deterministic TalkBack / layout-test order.
+  /// Digits first within each row, ops on the right, = last (large bar).
   static List<String> arithmeticKeyIdsInTalkBackOrder() => const [
         'clear',
         'del',
@@ -70,22 +74,25 @@ class Keypad extends StatelessWidget {
         'd3',
         'd0',
         'decimal',
-        'eq',
+        'comma',
         'add',
+        'eq',
       ];
 
   @override
   Widget build(BuildContext context) {
     // Force LTR for the keypad only. Parent RTL Directionality must NOT flip
-    // digit rows or reverse TalkBack swipe order.
+    // digit rows, scientific rows, or TalkBack swipe order.
     return Directionality(
       textDirection: TextDirection.ltr,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final spacing = 8.0;
           final cell = ((constraints.maxWidth - spacing * 3) / 4)
-              .clamp(48.0, 72.0);
+              .clamp(52.0, 76.0);
           final rowHeight = cell < 56 ? 56.0 : cell;
+          final equalsHeight =
+              rowHeight < 64 ? 64.0 : (rowHeight > 72 ? 72.0 : rowHeight);
 
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -115,11 +122,13 @@ class Keypad extends StatelessWidget {
                 spacing: spacing,
               ),
               SizedBox(height: spacing),
-              // Bottom block: 1 2 3 / 0 . = with LARGE + spanning two rows.
+              // Bottom digit block: 1 2 3 / 0 . , with LARGE + spanning
+              // two rows on the RIGHT (classic phone calculator).
               SizedBox(
                 height: rowHeight * 2 + spacing,
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
+                  textDirection: TextDirection.ltr,
                   children: [
                     Expanded(
                       flex: 3,
@@ -140,7 +149,7 @@ class Keypad extends StatelessWidget {
                               [
                                 _digit('0'),
                                 _decimal(),
-                                _equals(minHeight: rowHeight),
+                                _comma(minHeight: rowHeight),
                               ],
                               height: rowHeight,
                               spacing: spacing,
@@ -162,13 +171,15 @@ class Keypad extends StatelessWidget {
                 ),
               ),
               SizedBox(height: spacing),
-              // Comma kept for nroot(base, value); LTR quarter-width so TalkBack finds it after +.
-              Align(
-                alignment: Alignment.centerLeft,
-                child: SizedBox(
-                  width: (constraints.maxWidth - spacing * 3) / 4,
-                  height: rowHeight,
-                  child: _keyButton(context, _comma(), expand: true),
+              // Full-width equals bar — large, high-contrast, easy to reach.
+              SizedBox(
+                height: equalsHeight,
+                width: double.infinity,
+                child: _keyButton(
+                  context,
+                  _equals(minHeight: equalsHeight),
+                  expand: true,
+                  fullWidthEquals: true,
                 ),
               ),
             ],
@@ -188,6 +199,7 @@ class Keypad extends StatelessWidget {
       height: height,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.stretch,
+        textDirection: TextDirection.ltr,
         children: [
           for (var i = 0; i < keys.length; i++) ...[
             if (i > 0) SizedBox(width: spacing),
@@ -205,13 +217,17 @@ class Keypad extends StatelessWidget {
     BuildContext context,
     _CalcKey key, {
     bool expand = false,
+    bool fullWidthEquals = false,
   }) {
     final label = L10n.text(key.labelKey, settings.language);
     final speech = L10n.text(key.speechKey, settings.language);
     final hint =
         key.hintKey == null ? null : L10n.text(key.hintKey!, settings.language);
+    final isEquals = key.id == 'eq';
+    final isAdd = key.id == 'add';
     final button = Semantics(
       button: true,
+      // Explicit Arabic/English label; equals must announce يساوي.
       label: label,
       hint: hint,
       sortKey: key.sortOrder == null
@@ -219,9 +235,10 @@ class Keypad extends StatelessWidget {
           : OrdinalSortKey(key.sortOrder!, name: key.id),
       child: Material(
         color: _background(key.tone),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(fullWidthEquals ? 18 : 16),
+        elevation: isEquals || isAdd ? 3 : 0,
         child: InkWell(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(fullWidthEquals ? 18 : 16),
           onTap: () async {
             if (key.special == _Special.equals) {
               await model.equals();
@@ -237,16 +254,20 @@ class Keypad extends StatelessWidget {
             }
           },
           child: ConstrainedBox(
-            constraints: BoxConstraints(minHeight: key.minHeight),
+            constraints: BoxConstraints(
+              minHeight: key.minHeight,
+              minWidth: fullWidthEquals ? double.infinity : 0,
+            ),
             child: Center(
               child: Text(
                 key.title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: key.id == 'add' || key.id == 'eq' ? 28 : 18,
-                  fontWeight: FontWeight.w700,
+                  fontSize: isEquals || isAdd ? 32 : 18,
+                  fontWeight: FontWeight.w800,
                   color: _foreground(key.tone),
+                  letterSpacing: isEquals ? 2 : 0,
                 ),
               ),
             ),
@@ -307,7 +328,8 @@ class Keypad extends StatelessWidget {
       case _KeyTone.clear:
         return const Color(0xFFEB4038);
       case _KeyTone.equals:
-        return const Color(0xFF2EC761);
+        // High-contrast green for the large equals bar.
+        return const Color(0xFF1DB954);
     }
   }
 
@@ -391,17 +413,17 @@ class Keypad extends StatelessWidget {
 
   _CalcKey _divide() => _op('div', '÷', 'speak.divide', 'speak.divide', '/',
       order: 23);
-  _CalcKey _multiply() => _op('mul', '×', 'speak.multiply', 'speak.multiply', '*',
-      order: 33);
-  _CalcKey _subtract() => _op('sub', '−', 'speak.subtract', 'speak.subtract', '-',
-      order: 43);
+  _CalcKey _multiply() =>
+      _op('mul', '×', 'speak.multiply', 'speak.multiply', '*', order: 33);
+  _CalcKey _subtract() =>
+      _op('sub', '−', 'speak.subtract', 'speak.subtract', '-', order: 43);
   _CalcKey _add({required double minHeight}) => _op(
         'add',
         '+',
         'speak.add',
         'speak.add',
         '+',
-        order: 60,
+        order: 59,
         minHeight: minHeight,
       );
 
@@ -442,7 +464,7 @@ class Keypad extends StatelessWidget {
         minHeight: 56,
       );
 
-  _CalcKey _comma() => const _CalcKey(
+  _CalcKey _comma({double minHeight = 56}) => _CalcKey(
         id: 'comma',
         title: ',',
         labelKey: 'key.comma',
@@ -450,20 +472,20 @@ class Keypad extends StatelessWidget {
         speechKey: 'speak.comma',
         tone: _KeyTone.function,
         token: ',',
-        sortOrder: 70,
-        minHeight: 56,
+        sortOrder: 55,
+        minHeight: minHeight,
       );
 
   _CalcKey _equals({required double minHeight}) => _CalcKey(
         id: 'eq',
         title: '=',
-        labelKey: 'key.equals',
+        labelKey: 'key.equals', // يساوي
         hintKey: 'key.equals.hint',
         speechKey: 'speak.equals',
         tone: _KeyTone.equals,
         special: _Special.equals,
-        sortOrder: 55,
-        minHeight: minHeight < 56 ? 56 : minHeight,
+        sortOrder: 60,
+        minHeight: minHeight < 64 ? 64 : minHeight,
       );
 
   _CalcKey _op(
