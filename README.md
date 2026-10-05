@@ -29,3 +29,9 @@ Release APK is signed with the local debug keystore for sideload distribution.
 ## Tests
 
 Unit tests cover the expression evaluator and the speech math parser (Arabic and English phrases).
+
+## Download
+
+Permanent public APK:
+
+https://github.com/AliHusseinAlMarfadi96/advanced-calculator-android/releases/download/v1.0.0/AdvancedCalculator.apk
